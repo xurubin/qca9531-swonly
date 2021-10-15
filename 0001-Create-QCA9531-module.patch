@@ -1,0 +1,203 @@
+From 6b3edb94c6c807a239033c1971d78b2ba842716f Mon Sep 17 00:00:00 2001
+From: Rubin Xu
+Date: Fri, 15 Oct 2021 23:17:11 +0100
+Subject: [PATCH] Create QCA9531 module
+
+---
+ package/kernel/qca9531-swonly/Makefile             |  37 +++++++
+ package/kernel/qca9531-swonly/src/Kconfig          |   2 +
+ package/kernel/qca9531-swonly/src/Makefile         |   1 +
+ package/kernel/qca9531-swonly/src/qca9531-swonly.c | 119 +++++++++++++++++++++
+ 4 files changed, 159 insertions(+)
+ create mode 100644 package/kernel/qca9531-swonly/Makefile
+ create mode 100644 package/kernel/qca9531-swonly/src/Kconfig
+ create mode 100644 package/kernel/qca9531-swonly/src/Makefile
+ create mode 100644 package/kernel/qca9531-swonly/src/qca9531-swonly.c
+
+diff --git a/package/kernel/qca9531-swonly/Makefile b/package/kernel/qca9531-swonly/Makefile
+new file mode 100644
+index 0000000..1b5bab3
+--- /dev/null
++++ b/package/kernel/qca9531-swonly/Makefile
+@@ -0,0 +1,37 @@
++include $(TOPDIR)/rules.mk
++include $(INCLUDE_DIR)/kernel.mk
++
++PKG_NAME:=qca9531-swonly
++PKG_RELEASE=1
++PKG_LICENSE:=GPLv2
++
++include $(INCLUDE_DIR)/package.mk
++
++define KernelPackage/qca9531-swonly
++  SECTION:=kernel
++  TITLE:=Toggle SW_ONLY_MDOE for QCA9531
++  FILES:=$(PKG_BUILD_DIR)/qca9531-swonly.ko
++  AUTOLOAD:=$(call AutoProbe,qca9531-swonly)
++  KCONFIG:=
++endef
++
++EXTRA_KCONFIG:= \
++	CONFIG_QCA9531_SWONLY=m
++
++EXTRA_CFLAGS:= \
++	$(patsubst CONFIG_%, -DCONFIG_%=1, $(patsubst %=m,%,$(filter %=m,$(EXTRA_KCONFIG)))) \
++	$(patsubst CONFIG_%, -DCONFIG_%=1, $(patsubst %=y,%,$(filter %=y,$(EXTRA_KCONFIG)))) \
++
++MAKE_OPTS:= \
++	$(KERNEL_MAKE_FLAGS) \
++	SUBDIRS="$(PKG_BUILD_DIR)" \
++	EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
++	$(EXTRA_KCONFIG)
++
++define Build/Compile
++	$(MAKE) -C "$(LINUX_DIR)" \
++		$(MAKE_OPTS) \
++		modules
++endef
++
++$(eval $(call KernelPackage,qca9531-swonly))
+diff --git a/package/kernel/qca9531-swonly/src/Kconfig b/package/kernel/qca9531-swonly/src/Kconfig
+new file mode 100644
+index 0000000..4f3ef9e
+--- /dev/null
++++ b/package/kernel/qca9531-swonly/src/Kconfig
+@@ -0,0 +1,2 @@
++config CONFIG_QCA9531_SWONLY
++	tristate "QCA9531 SW_ONLY_MDOE"
+diff --git a/package/kernel/qca9531-swonly/src/Makefile b/package/kernel/qca9531-swonly/src/Makefile
+new file mode 100644
+index 0000000..2539b8e
+--- /dev/null
++++ b/package/kernel/qca9531-swonly/src/Makefile
+@@ -0,0 +1 @@
++obj-${CONFIG_QCA9531_SWONLY}	+= qca9531-swonly.o
+\ No newline at end of file
+diff --git a/package/kernel/qca9531-swonly/src/qca9531-swonly.c b/package/kernel/qca9531-swonly/src/qca9531-swonly.c
+new file mode 100644
+index 0000000..83f223b
+--- /dev/null
++++ b/package/kernel/qca9531-swonly/src/qca9531-swonly.c
+@@ -0,0 +1,119 @@
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
++
++#define BUFSIZE  100
++
++#define AR933X_GMAC_BASE (0x18070000)
++#define AR933X_GMAC_SIZE 0x04
++#define AR933X_GMAC_REG_ETH_CFG 0
++volatile u32 *rst_reset = (volatile u32 *) KSEG1ADDR(0x19000000);
++
++static struct proc_dir_entry *ent;
++
++static int sw_only_mode = 1;
++module_param(sw_only_mode, int, 0660);
++
++
++static u32 read_eth_config(void) {
++	void __iomem *base;
++	u32 t;
++
++	base = ioremap(AR933X_GMAC_BASE, AR933X_GMAC_SIZE);
++	t = __raw_readl(base + AR933X_GMAC_REG_ETH_CFG);
++
++	iounmap(base);
++	return t;
++}
++
++static int read_sw_only_mode(void) {
++	return 1 & (read_eth_config() >> 6);
++}
++
++static void write_sw_only_mode(int mode) {
++	void __iomem *base;
++	u32 t;
++
++	printk("write_sw_only_mode: %d\n", mode);
++
++	base = ioremap(AR933X_GMAC_BASE, AR933X_GMAC_SIZE);
++	t = __raw_readl(base + AR933X_GMAC_REG_ETH_CFG);
++
++	if (mode) {
++		t |= (7 << 6); //SW_ONLY_MODE | SW_PHY_SWAP | SW_PHY_ADDR_SWAP
++	} else {
++		t &= (~((u32)7 << 6));
++	}
++
++	__raw_writel(t, base + AR933X_GMAC_REG_ETH_CFG);
++	iounmap(base);
++
++	if (mode) {
++		rst_reset[0] |= (1 << 31);
++	} else {
++		rst_reset[0] &= (~(1 << 31));
++	}
++}
++
++static ssize_t mywrite(struct file *file, const char __user *ubuf,size_t count, loff_t *ppos)
++{
++	int num,c,mode;
++	char buf[BUFSIZE];
++	if(*ppos > 0 || count > BUFSIZE)
++		return -EFAULT;
++	if(copy_from_user(buf,ubuf,count))
++		return -EFAULT;
++	num = sscanf(buf,"%d",&mode);
++	write_sw_only_mode(mode);
++	if(num != 1)
++		return -EFAULT;
++	c = strlen(buf);
++	*ppos = c;
++	return c;
++}
++
++static ssize_t myread(struct file *file, char __user *ubuf,size_t count, loff_t *ppos)
++{
++	char buf[BUFSIZE];
++	int len=0;
++	if(*ppos > 0 || count < BUFSIZE)
++		return 0;
++	len += sprintf(buf,"sw_only_mode = %d\n",read_sw_only_mode());
++	len += sprintf(buf + len,"eth_config = 0x%x\n",read_eth_config());
++
++	if(copy_to_user(ubuf,buf,len))
++		return -EFAULT;
++	*ppos = len;
++	return len;
++}
++
++static struct file_operations myops =
++{
++	.owner = THIS_MODULE,
++	.read = myread,
++	.write = mywrite,
++};
++
++
++static int simple_init(void)
++{
++	ent=proc_create("qca9531_sw_only_mode",0660,NULL,&myops);
++	write_sw_only_mode(sw_only_mode);
++	return 0;
++}
++
++static void simple_cleanup(void)
++{
++	proc_remove(ent);
++}
++
++module_init(simple_init);
++module_exit(simple_cleanup);
++
++MODULE_AUTHOR("R Xu");
++MODULE_LICENSE("GPL v2");
++
+-- 
+2.7.4
+
